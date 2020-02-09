@@ -8,12 +8,16 @@
 #include <netinet/in.h> // IPPROTO_TCP
 #include <netinet/tcp.h> // TCP_NODELAY
 #include <sys/socket.h> // accept, etc.
+#include <sys/un.h> // unix sockets
+#include <unistd.h> // getcwd
 #include <xcb/xcb.h>
 #include <xcb/xcb_image.h> // xcb_image_t
 #include <xcb/shm.h>
 #include <xcb/xcb_keysyms.h>
 #include <xcb/xtest.h>
 #include "ax11.h"
+
+#define PATH_MAX 4096
 
 #define AX11_OK 0
 
@@ -76,23 +80,30 @@ static int g_supportsMitShm = 0;
 static int g_supportsVShm = 0;
 static xcb_key_symbols_t* g_syms = NULL;
 
-int create_socket_server(struct sockaddr_in* address)
+double mstime()
+{
+    struct timeval  tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec) * 1000 + (tv.tv_usec) / 1000;
+}
+
+int create_socket_server_tcp(struct sockaddr_in* address)
 {
     int server_sock; 
-    int opt = 1; 
+    int opt = 1;
 
     if ((server_sock = socket(AF_INET, SOCK_STREAM, 0)) == 0) 
     { 
         perror("socket failed"); 
         exit(EXIT_FAILURE); 
     }
-
-    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) 
-    { 
+    
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)))
+    {
         perror("setsockopt"); 
         exit(EXIT_FAILURE); 
     }
-       
+        
     if (bind(server_sock, (struct sockaddr*)address, sizeof(*address)) < 0) 
     { 
         perror("bind failed"); 
@@ -110,13 +121,50 @@ int create_socket_server(struct sockaddr_in* address)
     return server_sock;
 }
 
-struct sockaddr_in create_socket_address(int port)
+int create_socket_server_unix(struct sockaddr_un* address)
+{
+    int server_sock; 
+
+    if ((server_sock = socket(AF_UNIX, SOCK_STREAM, 0)) == 0) 
+    { 
+        perror("socket failed"); 
+        exit(EXIT_FAILURE); 
+    }
+    
+    unlink(address->sun_path);
+    if (bind(server_sock, (struct sockaddr*)address, sizeof(*address)) < 0) 
+    { 
+        perror("bind failed"); 
+        exit(EXIT_FAILURE); 
+    } 
+
+    printf("Starting server on %s\n", address->sun_path);
+    if (listen(server_sock, 3) < 0) 
+    { 
+        perror("listen"); 
+        exit(EXIT_FAILURE); 
+    }
+
+    printf("Listening for connections...\n");
+    return server_sock;
+}
+
+struct sockaddr_in create_socket_address_tcp(int port)
 {
     struct sockaddr_in address; 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     address.sin_port = htons(port);
     return address;
+}
+
+struct sockaddr_un create_socket_address_unix(const char* path)
+{
+    struct sockaddr_un serveraddr;
+    memset(&serveraddr, 0, sizeof(serveraddr));
+    serveraddr.sun_family = AF_UNIX;
+    strcpy(serveraddr.sun_path, path);
+    return serveraddr;
 }
 
 int read_all(int sock, void* dest, int size) 
@@ -158,10 +206,10 @@ void get_image_no_shmem(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** 
 
 void get_image(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
 {
-    static clock_t captureLast = 0;
-    static clock_t captureStart = 0;
+    static double captureLast = 0;
+    static double captureStart = 0;
 
-    captureStart = clock(); 
+    captureStart = mstime(); 
     if (g_supportsVShm && g_supportsMitShm) {
 		// TODO	
         printf("MIT-SHM Not implemented\n");
@@ -171,100 +219,12 @@ void get_image(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
         get_image_no_shmem(con, scr, pImage);
 	}
 
-    clock_t now = clock();
-    double captureTime = (double)(now - captureStart) / (double)(CLOCKS_PER_SEC);
-    double streamTime = (double)(now - captureLast) / (double)(CLOCKS_PER_SEC);
-    printf("Capture FPS: %f | Stream FPS: %f\n", 1.0 / captureTime, 1.0 / streamTime);
+    double now = mstime();
+    double captureTime = now - captureStart;
+    double streamTime = now - captureLast;
+    printf("Capture FPS: %f | Stream FPS: %f\n", 1000.0 / captureTime, 1000.0 / streamTime);
     captureLast = now;
 }
-
-/** BEGIN LIBRARY API */
-
-int32_t ax11_connect(const char* display, void** out_connection)
-{
-    xcb_connection_t* con = xcb_connect(display, NULL);
-    if (xcb_connection_has_error(con))
-	{
-        *out_connection = NULL;
-        return EAGAIN;
-	}
-
-    *out_connection = con;
-    return 0;
-}
-
-int32_t ax11_get_image(void* con, ax11_image* out_image)
-{
-    const xcb_setup_t* setup = xcb_get_setup(con);
-    xcb_screen_t* scr = xcb_setup_roots_iterator(setup).data;
-    xcb_image_format_t format = XCB_IMAGE_FORMAT_Z_PIXMAP;
-    xcb_window_t window = scr->root;
-
-    xcb_get_geometry_cookie_t gcookie = xcb_get_geometry(con, window);
-    xcb_get_geometry_reply_t* greply = xcb_get_geometry_reply(con, gcookie, NULL);
-
-    assert(greply->x == 0);
-    assert(greply->y == 0);
-
-    xcb_get_image_cookie_t cookie = xcb_get_image(con, format, window, 0, 0, 
-                                                greply->width, greply->height, ~0);
-
-    xcb_get_image_reply_t* reply = xcb_get_image_reply(con, cookie, NULL);
-    void* data = xcb_get_image_data(reply);
-
-    *out_image = (ax11_image){
-        format,
-        greply->depth,
-        setup->image_byte_order,
-        32,
-        4 * greply->width,
-        greply->width,
-        greply->height,
-        data,
-        reply,
-    };
-    return 0;
-}
-
-int32_t ax11_free_image(ax11_image* image)
-{
-    free(image->handle);
-    return 0;
-}
-
-int32_t ax11_fake_key_event(void* con, int32_t key_sym, int32_t is_press, int32_t delay)
-{
-    xcb_keysym_t keysym = key_sym;
-    xcb_keycode_t* keycodes = xcb_key_symbols_get_keycode(g_syms, keysym);
-    xcb_keycode_t keycode = keycodes[0];
-    free(keycodes);
-
-    if (keycode == XCB_NO_SYMBOL) {
-        return EBADMSG;
-    }
-
-    uint8_t type = is_press ? XCB_KEY_PRESS : XCB_KEY_RELEASE;
-    xcb_test_fake_input(con, type, keycode, XCB_CURRENT_TIME + delay, XCB_NONE, 0, 0, 0);
-    xcb_flush(con);
-    return 0;
-}
-
-int32_t ax11_fake_button_event(void* con, int32_t button, int32_t is_press, int32_t delay)
-{
-    uint8_t type = is_press ? XCB_BUTTON_PRESS : XCB_BUTTON_RELEASE;
-    xcb_test_fake_input(con, type, button, XCB_CURRENT_TIME + delay, XCB_NONE, 0, 0, 0);
-    xcb_flush(con);
-    return 0;
-}
-
-int32_t ax11_fake_motion_event(void* con, int32_t x, int32_t y, int32_t delay)
-{
-    xcb_test_fake_input(con, XCB_MOTION_NOTIFY, 0, XCB_CURRENT_TIME + delay, XCB_NONE, x, y, 0);
-    xcb_flush(con);
-    return 0;
-}
-
-/** END_LIBRARY_API */
 
 int handle_refresh_request(int sock, xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
 {
@@ -363,9 +323,6 @@ int check_mit_shm(xcb_connection_t* con)
 
 int main()
 {
-    void* p;
-    ax11_connect(NULL, &p);
-
 	const char* displayEnv = getenv("DISPLAY");
     xcb_connection_t* con = xcb_connect(displayEnv ? displayEnv : ":0.0", NULL);
 	if(xcb_connection_has_error(con))
@@ -393,8 +350,12 @@ int main()
 
     printf("Using XShmGetImage (speedup): %d\n", g_supportsVShm && g_supportsMitShm);
 
-    struct sockaddr_in address = create_socket_address(AX11_PORT);
-    int server_sock = create_socket_server(&address);
+    char sock_path[PATH_MAX] = { 0 };
+    getcwd(sock_path, PATH_MAX);
+    strcat(sock_path, "/ax11_unix");
+
+    struct sockaddr_un address = create_socket_address_unix(sock_path);
+    int server_sock = create_socket_server_unix(&address);
 
     xcb_screen_t* scr = xcb_setup_roots_iterator(xcb_get_setup(con)).data;
     g_syms = xcb_key_symbols_alloc(con);
@@ -406,22 +367,20 @@ int main()
         socklen_t addrlen = sizeof(address);
 
         reconnect:
-        if ((client_sock = accept(server_sock, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0) 
+        if ((client_sock = accept4(server_sock, (struct sockaddr*)&address, (socklen_t*)&addrlen, SOCK_CLOEXEC)) < 0) 
         {
-            perror("accept"); 
+            perror("accept4"); 
             exit(EXIT_FAILURE); 
         }
 
-        int buf_size = 16 * 1024 * 1024;
+        int buf_size = 4 * 1024 * 1024;
         setsockopt(client_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-        
-        int no_delay = 1;
-        setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
         printf("Connection established!\n");
 
         while (1)
         {
             ax11_msg msg;
+            printf("Waiting for message...\n");
             if (read_all(client_sock, &msg, sizeof(msg))) {
                 goto connreset;
             }

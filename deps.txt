@@ -1,0 +1,22 @@
+
+run autoreconf -i in all
+use musl-gcc
+use CFLAGS to relative libs aka ./configure CC=musl-gcc --enable-static CFLAGS='-static -I/home/veselin/src/ax11_client/include -I/home/veselin/src/ax11_client/xorgproto/include -L/home/veselin/src/ax11_client/deps'
+
+libxcb: 
+    ./configure --enable-static CC=musl-gcc CFLAGS='-static -I/home/veselin/src/ax11_client/include -I/home/veselin/src/ax11_client/xorgproto/include  -I/home/veselin/src/ax11_client/libxau/include -I/home/veselin/src/ax11_client/libXdmcp/include -L/home/veselin/src/ax11_client/deps -lXau'
+    #undef HAVE_LAUNCHD in src/config.h
+
+libxcb-image: 
+    ./configure CC=musl-gcc --enable-static CFLAGS='-static -I/home/veselin/src/ax11_client/include -I/home/veselin/src/ax11_client/xorgproto/include  -I/home/veselin/src/ax11_client/libxau/include -I/home/veselin/src/ax11_client/libXdmcp/include -L/home/veselin/src/ax11_client/deps -Wl,--unresolved-symbols=ignore-in-object-files'
+
+libxcb-keysyms: 
+    git clone --recursive https://gitlab.freedesktop.org/xorg/lib/libxcb-keysyms.git
+    cd libxcb-keysyms
+    git checkout 0.4.0
+    autoreconf -i
+    ./configure CC=musl-gcc --enable-static CFLAGS='-static -I/home/veselin/src/ax11_client/include -I/home/veselin/src/ax11_client/xorgproto/include'
+    make
+    cd ..
+    cp libxcb-keysyms/keysyms/.libs/libxcb-keysyms.a ./deps/
+    cp libxcb-keysyms/keysyms/*.h ./deps/
