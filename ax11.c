@@ -7,6 +7,7 @@
 #include <sys/shm.h> // shmget, etc.
 #include <netinet/in.h> // IPPROTO_TCP
 #include <netinet/tcp.h> // TCP_NODELAY
+#include <sys/time.h> // gettimeofday
 #include <sys/socket.h> // accept, etc.
 #include <sys/un.h> // unix sockets
 #include <unistd.h> // getcwd
@@ -175,6 +176,54 @@ int read_all(int sock, void* dest, int size)
     return 0;
 }
 
+void get_image_shmem(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
+{
+    static xcb_shm_segment_info_t s_segment;
+    xcb_image_format_t format = XCB_IMAGE_FORMAT_Z_PIXMAP;    
+    xcb_window_t window = scr->root;
+
+    xcb_shm_query_version_reply_t* reply = xcb_shm_query_version_reply(
+        con,
+        xcb_shm_query_version(con),
+        NULL
+    );
+
+    if (!reply || !reply->shared_pixmaps) {
+        assert(!reply || !reply->shared_pixmaps);
+    }
+
+    xcb_get_geometry_cookie_t gcookie = xcb_get_geometry(con, window);
+    xcb_get_geometry_reply_t* greply = xcb_get_geometry_reply(con, gcookie, NULL);
+
+    if (!s_segment.shmaddr) {
+        s_segment.shmid = shmget(IPC_PRIVATE, greply->height * greply->width * 4, IPC_CREAT | 0777);
+        s_segment.shmaddr = shmat(s_segment.shmid, 0, 0);
+
+        s_segment.shmseg = xcb_generate_id(con);
+        xcb_shm_attach(con, s_segment.shmseg, s_segment.shmid, 0);
+        // shmctl(s_segment.shmid, IPC_RMID, 0);
+    }
+
+    xcb_shm_get_image_cookie_t iq = xcb_shm_get_image(
+        con, scr->root,
+        0, 0, greply->width, greply->height, ~0,
+        XCB_IMAGE_FORMAT_Z_PIXMAP, s_segment.shmseg, 0);
+
+    xcb_shm_get_image_reply_t* img = xcb_shm_get_image_reply(con, iq, NULL);
+    xcb_flush(con);
+
+    if (*pImage) {
+        printf("Freeing previous image %p\n", (*pImage)->base);
+        xcb_image_destroy(*pImage);
+    }
+
+    *pImage = xcb_image_create_native(con, greply->width, greply->height, format, 
+                                   greply->depth, NULL, ~0, s_segment.shmaddr);
+
+    (*pImage)->base = reply;
+    assert((*pImage)->data == s_segment.shmaddr);
+}
+
 void get_image_no_shmem(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
 {
     xcb_image_format_t format = XCB_IMAGE_FORMAT_Z_PIXMAP;    
@@ -209,11 +258,13 @@ void get_image(xcb_connection_t* con, xcb_screen_t* scr, xcb_image_t** pImage)
     static double captureLast = 0;
     static double captureStart = 0;
 
+    if (captureLast) {
+        return;
+    }
+
     captureStart = mstime(); 
     if (g_supportsVShm && g_supportsMitShm) {
-		// TODO	
-        printf("MIT-SHM Not implemented\n");
-        exit(1);
+        get_image_shmem(con, scr, pImage);
 	}
 	else {
         get_image_no_shmem(con, scr, pImage);
@@ -350,12 +401,8 @@ int main()
 
     printf("Using XShmGetImage (speedup): %d\n", g_supportsVShm && g_supportsMitShm);
 
-    char sock_path[PATH_MAX] = { 0 };
-    getcwd(sock_path, PATH_MAX);
-    strcat(sock_path, "/ax11_unix");
-
-    struct sockaddr_un address = create_socket_address_unix(sock_path);
-    int server_sock = create_socket_server_unix(&address);
+    struct sockaddr_in address = create_socket_address_tcp(AX11_PORT);
+    int server_sock = create_socket_server_tcp(&address);
 
     xcb_screen_t* scr = xcb_setup_roots_iterator(xcb_get_setup(con)).data;
     g_syms = xcb_key_symbols_alloc(con);
@@ -367,9 +414,13 @@ int main()
         socklen_t addrlen = sizeof(address);
 
         reconnect:
+        #ifdef _GNU_SOURCE
         if ((client_sock = accept4(server_sock, (struct sockaddr*)&address, (socklen_t*)&addrlen, SOCK_CLOEXEC)) < 0) 
+        #else
+        if ((client_sock = accept(server_sock, (struct sockaddr*)&address, (socklen_t*)&addrlen)) < 0) 
+        #endif
         {
-            perror("accept4"); 
+            perror("accept"); 
             exit(EXIT_FAILURE); 
         }
 
